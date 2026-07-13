@@ -1,66 +1,114 @@
 #!/usr/bin/env python3
 """
-evtx2csv.py — Parser file .evtx (Windows Event Log) langsung ke CSV FLAT.
+evtx2csv.py — Parse a Windows Event Log (.evtx) file directly into a FLAT CSV.
 
-Tidak ada JSON tersisa di dalam sel manapun — setiap field <Data Name="X">Y</Data>
-di EventData/UserData dijadikan kolom sendiri, jadi hasilnya bisa langsung
-diproses dengan awk, cut, grep, dst tanpa perlu parsing tambahan.
+No JSON is left inside any cell. Every <Data Name="X">Y</Data> field found in
+EventData/UserData becomes its own column, so the output can be piped straight
+into awk, cut, grep, etc. without any further parsing.
 
 --------------------------------------------------------------------------
-CATATAN PENTING (v3): backend parsing diganti dari `python-evtx` ke `evtx`
-(Rust binding, proyek omerbenamram/pyevtx-rs).
+CHANGELOG
 
-Root cause bug versi sebelumnya: `python-evtx` membaca jumlah chunk dari
-field `chunk_count` di FILE HEADER evtx, TANPA memvalidasi ke ukuran file
-fisik. Untuk file yang berstatus "dirty" (proses/servicenya tidak sempat
-menutup log dengan bersih -- umum terjadi pada image forensik/snapshot VM),
-field metadata ini tidak terupdate dan menunjukkan angka yang jauh lebih
-kecil dari jumlah chunk yang sebenarnya tertulis di file. Akibatnya ribuan
-record di bagian akhir file terlewat tanpa ada pesan error sama sekali.
+v5:
+  - Renamed a small set of genuinely ambiguous raw field names that Windows/
+    Sysmon itself uses. These are NOT collisions with fixed columns (that
+    was fixed in v4) -- they're dynamic fields whose *own* names are
+    confusing next to each other or next to unrelated columns:
+      * "Hash"  (EventId 15, FileCreateStreamHash only) -> "StreamHash"
+        Distinguishes it from "Hashes" (EventId 1/6/7/26/29), which holds
+        the same "SHA1=..,MD5=..,SHA256=.." format under a near-identical
+        name -- easy to miss one of the two in a single grep/awk pass.
+      * "ID" (EventId 255 only) -> "SysmonErrorCode"
+        The raw name "ID" sat right next to EventId/EventRecordId/
+        ProcessGuid and looked like it should be some kind of record
+        identifier; it actually holds a Sysmon-internal diagnostic code
+        such as "IMAGE_LOAD" or "QUEUE".
+      * "EventType" (EventId 12/13/14/17/18, registry/pipe events) ->
+        "RegistryEventType"
+        Easy to confuse with "EventId" at a glance; it actually holds an
+        operation label such as "SetValue" or "DeleteKey", unrelated to
+        the EventId number.
+    All other field names are left exactly as Windows/Sysmon defines them
+    (e.g. SourceImage/TargetImage/ParentImage, SourceProcessId/
+    TargetProcessId/ParentProcessId), since those are legitimately
+    different, self-explanatory fields and renaming them would only make
+    cross-referencing the official Sysmon schema harder.
 
-Terbukti pada file uji: file 25MB, `chunk_count` header = 19 -> python-evtx
-cuma baca 1141 record. Padahal ukuran file cukup untuk 385 chunk fisik, dan
-EvtxECmd (Zimmerman tools) maupun `evtx` (Rust) sama-sama membaca 20083
-record secara utuh -- karena keduanya menghitung chunk dari ukuran file,
-bukan cuma percaya field metadata di header.
+v4:
+  - Fixed a silent column-collision bug. Sysmon (and other providers) can
+    emit an EventData field named "ProcessId" or "Version" — these names
+    clashed with the *fixed* <System> columns of the same name (the PID of
+    the process that logged the event, and the event schema version). The
+    dynamic field silently overwrote the fixed one, so the fixed column's
+    real value was lost with no warning. Fixed columns are now written
+    under unambiguous names (ExecutionProcessId, ExecutionThreadId,
+    EventVersion) that cannot collide with anything Windows puts in
+    EventData. As a second line of defense, ANY future dynamic field name
+    that still collides with a fixed column is auto-suffixed ("_data")
+    instead of silently overwriting — this makes the script robust for
+    event types not seen during testing.
+  - All comments, docstrings, and CLI/log messages translated to English.
+  - Verified against multiple event shapes: EventData with Name attributes
+    (Sysmon), EventData with unnamed <Data> elements (e.g. Windows Error
+    Reporting, Event ID 1001), and UserData-based events (e.g. Windows
+    Update Client) — all three code paths are covered by tests.
+
+v3:
+  - Switched the read backend from `python-evtx` to `evtx` (Rust binding,
+    omerbenamram/pyevtx-rs). Root cause of a data-loss bug in earlier
+    versions: `python-evtx` trusts the `chunk_count` field in the .evtx
+    FILE HEADER without validating it against the actual file size. For a
+    "dirty" file (the log wasn't closed cleanly — common with forensic
+    images/VM snapshots), that header field is stale and reports far fewer
+    chunks than actually exist on disk. On a 25MB test file the header
+    claimed chunk_count=19, so python-evtx read only 1,141 records — while
+    the file size was large enough for 385 chunks and 20,083 records, which
+    both EvtxECmd (Zimmerman tools) and the `evtx` Rust backend read in
+    full. `evtx` computes the chunk count from file size, so it isn't
+    fooled by a stale header value.
+  - Record iteration uses a manual next()/try-except loop rather than a
+    plain `for record in parser.records():`, because PyEvtxParser's own
+    documentation states iteration can raise RuntimeError on encountering
+    an invalid record and stop the loop early. The manual pattern skips
+    just the bad record and keeps going until the iterator is truly
+    exhausted.
 --------------------------------------------------------------------------
 
-Cara kerja:
-  1. Baca file .evtx pakai library `evtx` (Rust binding, sudah battle-tested
-     untuk file dirty/corrupt -- dipakai juga oleh banyak tool DFIR lain).
-  2. Iterasi record dilakukan dengan pola next()/try-except manual (BUKAN
-     `for record in parser.records()` polos), karena dokumentasi resmi
-     library ini menyebutkan iterasi bisa melempar RuntimeError di tengah
-     jalan dan menghentikan for-loop biasa secara tiba-tiba. Dengan pola
-     manual, satu record gagal dilewati tapi iterasi tetap lanjut.
-  3. Setiap record (XML) di-parse (System + EventData/UserData). Semua
-     newline/tab/CR di dalam value dinormalisasi jadi spasi, supaya satu
-     record SELALU jadi satu baris fisik CSV (aman untuk `wc -l`, `awk`,
-     pemrosesan baris-per-baris pada umumnya).
-  4. File dibaca sekali, seluruh record disimpan di memori lalu ditulis
-     dengan header = UNION semua nama field yang pernah muncul, supaya
-     header CSV lengkap & posisi kolom konsisten dari baris pertama.
+How it works:
+  1. Read the .evtx file using the `evtx` library (Rust binding — robust
+     against dirty/corrupt files, and used by several other DFIR tools).
+  2. Iterate records with a manual next()/try-except loop so a single bad
+     record is skipped (and logged) instead of silently truncating the
+     rest of the file.
+  3. Parse each record's XML (System + EventData/UserData). All newline/
+     tab/CR characters inside values are normalized to single spaces, so
+     one record always maps to exactly one physical CSV line (safe for
+     `wc -l`, `awk`, and any line-based Unix tool).
+  4. All records are buffered in memory, then written out with a header
+     equal to the UNION of every field name seen across the whole file, so
+     the header is complete and column positions stay consistent from the
+     first row to the last.
 
-Install dependency (sekali saja):
+Install the dependency (once):
     pip install evtx --break-system-packages
 
-Cara pakai:
+Usage:
     python3 evtx2csv.py <input.evtx> [-o output.csv]
                          [--event-id 1,11,13]
                          [--fields TimeCreated,EventId,Image,CommandLine,...]
                          [--delimiter ","|"|"|"tab"]
 
-Contoh:
-    # Semua event, semua kolom -> CSV lengkap
+Examples:
+    # All events, all columns -> full CSV
     python3 evtx2csv.py Microsoft-Windows-Sysmon_4Operational.evtx -o sysmon.csv
 
-    # Hanya EventId 1 (Process Create) dan 11 (FileCreate)
+    # Only EventId 1 (Process Create) and 11 (FileCreate)
     python3 evtx2csv.py Sysmon.evtx --event-id 1,11 -o procfile.csv
 
-    # Delimiter pipe, lebih aman untuk awk -F'|' karena jarang muncul di data Windows
+    # Pipe delimiter — safer for awk -F'|' since '|' rarely appears in Windows data
     python3 evtx2csv.py Sysmon.evtx --delimiter "|" -o sysmon_pipe.csv
 
-    # Setelah jadi CSV (delimiter koma default), ambil kolom pakai header dinamis:
+    # After conversion (default comma delimiter), pull columns by header lookup:
     awk -F',' 'NR==1{for(i=1;i<=NF;i++)h[$i]=i; next} {print $h["TimeCreated"], $h["Image"]}' sysmon.csv
 """
 
@@ -75,15 +123,19 @@ try:
     from evtx import PyEvtxParser
 except ImportError:
     print(
-        "Library 'evtx' belum terinstall.\n"
-        "Jalankan dulu: pip install evtx --break-system-packages",
+        "The 'evtx' library is not installed.\n"
+        "Install it first: pip install evtx --break-system-packages",
         file=sys.stderr,
     )
     sys.exit(1)
 
 NS = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
 
-# Kolom tetap (selalu ada di setiap event, diambil dari elemen <System>)
+# Fixed columns, always present for every event (derived from <System>).
+# Names are chosen so they can NEVER collide with a dynamic EventData/UserData
+# field name that Windows might emit (e.g. Sysmon's own "ProcessId" or
+# "Version" fields, which are about the *subject* of the event, not the
+# process/schema version that logged it).
 FIXED_COLUMNS = [
     "TimeCreated",
     "EventId",
@@ -92,14 +144,15 @@ FIXED_COLUMNS = [
     "Channel",
     "Computer",
     "UserId",
-    "ProcessId",
-    "ThreadId",
+    "ExecutionProcessId",
+    "ExecutionThreadId",
     "Level",
     "Task",
     "Opcode",
     "Keywords",
-    "Version",
+    "EventVersion",
 ]
+FIXED_COLUMNS_SET = set(FIXED_COLUMNS)
 
 DELIMITER_MAP = {
     ",": ",",
@@ -109,16 +162,34 @@ DELIMITER_MAP = {
     "\\t": "\t",
 }
 
+# Some raw Windows/Sysmon field names are genuinely confusing on their own,
+# independent of the fixed-column collision issue above -- e.g. Sysmon uses
+# both "Hash" (EventId 15, FileCreateStreamHash) and "Hashes" (EventId 1, 6,
+# 7, 26, 29) for the exact same "SHA1=..,MD5=..,SHA256=.." content, which is
+# easy to miss with a single grep/awk across a whole export. This map renames
+# just those specific names to something unambiguous; every other field name
+# is left exactly as Windows/Sysmon defines it, so it still matches the
+# official Sysmon schema documentation and other tools' output.
+AMBIGUOUS_NAME_MAP = {
+    "Hash": "StreamHash",  # EventId 15 only; distinct from "Hashes" (EventId 1/6/7/26/29)
+    "ID": "SysmonErrorCode",  # EventId 255 only; a Sysmon-internal diagnostic code
+    # (e.g. "IMAGE_LOAD", "QUEUE"), unrelated to EventId/EventRecordId/ProcessGuid
+    "EventType": "RegistryEventType",  # EventId 12/13/14/17/18; a registry/pipe operation label
+    # (e.g. "SetValue", "DeleteKey"), unrelated to EventId
+}
+
 
 def clean_value(text):
     """
-    Normalisasi satu nilai field supaya:
-    - Tidak ada \\r atau \\n tersisa (diganti spasi) -> 1 record = 1 baris fisik CSV.
-    - Tidak ada tab tersisa (diganti spasi) -> aman untuk delimiter tab juga.
-    - Whitespace berlebih di awal/akhir dipangkas.
-    Tanpa fungsi ini, field seperti daftar path yang dipisah "\\n" (umum di
-    event WER / EventID 1001) akan membuat satu record tersebar ke banyak
-    baris fisik di file CSV walau secara sintaks CSV masih "valid" (ter-quote).
+    Normalize a single field value so that:
+    - No \\r or \\n survives (replaced with a space) -> 1 record = 1 physical
+      CSV line.
+    - No tab survives (replaced with a space) -> also safe with --delimiter tab.
+    - Leading/trailing/duplicate whitespace is collapsed.
+    Without this, a field such as a newline-separated list of paths (common
+    in Windows Error Reporting Event ID 1001) would spread a single record
+    across multiple physical CSV lines, even though it stays valid CSV
+    syntax (quoted).
     """
     if text is None:
         return ""
@@ -132,24 +203,58 @@ def clean_value(text):
     return text
 
 
+def add_dynamic_field(record, name, value):
+    """
+    Add a field coming from EventData/UserData into the record dict.
+
+    Three safety nets, applied in order:
+    1. Rename known-ambiguous raw field names (see AMBIGUOUS_NAME_MAP) to
+       something unambiguous, e.g. Sysmon's "Hash" (EventId 15 only) becomes
+       "StreamHash" so it can't be confused with "Hashes" (EventId 1/6/7/
+       26/29) in a grep/awk across the whole file.
+    2. If this exact field name already appeared earlier in the SAME event
+       (rare but possible), the values are concatenated with " | " instead
+       of overwriting one another.
+    3. If the (possibly renamed) name still collides with one of the FIXED
+       (<System>-derived) columns, it is stored under "<name>_data" instead
+       of overwriting the fixed column. This is a defensive fallback: the
+       current FIXED_COLUMNS names were chosen specifically to avoid known
+       collisions (ProcessId, Version), but this guard keeps the script safe
+       against any other provider/event type that reuses a fixed column's
+       name in the future.
+    """
+    if name in AMBIGUOUS_NAME_MAP:
+        name = AMBIGUOUS_NAME_MAP[name]
+
+    if name in FIXED_COLUMNS_SET:
+        name = f"{name}_data"
+
+    if name in record and record[name]:
+        record[name] = record[name] + " | " + value
+    else:
+        record[name] = value
+
+
 def parse_record_xml(xml_str):
     """
-    Parse satu record XML evtx menjadi dict flat:
-    - Kolom tetap dari <System> (TimeCreated, EventId, dst)
-    - Kolom dinamis dari <EventData>/<UserData> -> setiap <Data Name="X">Y</Data>
-      jadi key X.
-    Kalau EventData tidak berbentuk Name/value (kasus jarang, mis. hanya teks
-    polos), disimpan ke kolom "EventData_Raw".
+    Parse a single evtx record's XML into a flat dict:
+    - Fixed columns from <System> (TimeCreated, EventId, etc.)
+    - Dynamic columns from <EventData>/<UserData> -> each
+      <Data Name="X">Y</Data> becomes key X (or "X_data" if X collides with
+      a fixed column name — see add_dynamic_field).
+    If EventData has no Name/value structure at all (rare — plain text
+    <Data> elements with no Name attribute), everything is joined into a
+    single "EventData_Raw" column.
 
-    Semua nilai teks dilewatkan clean_value() supaya tidak ada newline/tab
-    tersisa di dalam sel CSV.
+    All text values pass through clean_value() so no newline/tab survives
+    inside a CSV cell.
     """
     root = ET.fromstring(xml_str)
 
     system = root.find("e:System", NS)
     if system is None:
         raise ValueError(
-            "Elemen <System> tidak ditemukan, kemungkinan record korup/tidak standar"
+            "<System> element not found — record is likely corrupt or non-standard"
         )
 
     record = {}
@@ -162,7 +267,7 @@ def parse_record_xml(xml_str):
     eventid_el = system.find("e:EventID", NS)
     record["EventId"] = clean_value(eventid_el.text) if eventid_el is not None else ""
 
-    record["Version"] = _text(system, "e:Version")
+    record["EventVersion"] = _text(system, "e:Version")
     record["Level"] = _text(system, "e:Level")
     record["Task"] = _text(system, "e:Task")
     record["Opcode"] = _text(system, "e:Opcode")
@@ -184,11 +289,11 @@ def parse_record_xml(xml_str):
 
     exec_el = system.find("e:Execution", NS)
     if exec_el is not None:
-        record["ProcessId"] = clean_value(exec_el.get("ProcessID")) or ""
-        record["ThreadId"] = clean_value(exec_el.get("ThreadID")) or ""
+        record["ExecutionProcessId"] = clean_value(exec_el.get("ProcessID")) or ""
+        record["ExecutionThreadId"] = clean_value(exec_el.get("ThreadID")) or ""
     else:
-        record["ProcessId"] = ""
-        record["ThreadId"] = ""
+        record["ExecutionProcessId"] = ""
+        record["ExecutionThreadId"] = ""
 
     eventdata = root.find("e:EventData", NS)
     userdata = root.find("e:UserData", NS)
@@ -201,29 +306,26 @@ def parse_record_xml(xml_str):
                 name = d.get("Name")
                 if name:
                     has_name = True
-                    value = clean_value(d.text)
-                    if name in record and record[name]:
-                        record[name] = record[name] + " | " + value
-                    else:
-                        record[name] = value
+                    add_dynamic_field(record, name, clean_value(d.text))
             if not has_name:
+                # <Data> elements with no Name attribute at all -> join into one column
                 texts = [clean_value(d.text) for d in data_items]
                 record["EventData_Raw"] = " | ".join(t for t in texts if t)
         else:
+            # EventData is present but empty / has no <Data> children
             raw_text = clean_value("".join(eventdata.itertext()))
             if raw_text:
                 record["EventData_Raw"] = raw_text
     elif userdata is not None:
+        # UserData's inner structure is provider-defined and varies freely;
+        # best-effort flatten: every descendant tag name -> its text content.
         for child in userdata.iter():
-            tag = child.tag.split("}")[-1]
+            tag = child.tag.split("}")[-1]  # strip XML namespace
             if tag == "UserData":
                 continue
             text = clean_value(child.text)
             if text:
-                if tag in record and record[tag]:
-                    record[tag] = record[tag] + " | " + text
-                else:
-                    record[tag] = text
+                add_dynamic_field(record, tag, text)
 
     return record
 
@@ -235,16 +337,18 @@ def _text(parent, tag):
 
 def iter_records(evtx_path, error_counter):
     """
-    Generator: baca .evtx via library `evtx` (Rust), yield record_dict per event.
+    Generator: read a .evtx file via the `evtx` (Rust) library and yield one
+    flat record dict per event.
 
-    PENTING: pakai pola next()/try-except manual, BUKAN `for record in
-    parser.records():` polos. Dokumentasi resmi PyEvtxParser.records()
-    menyatakan iterasi bisa melempar RuntimeError saat menemui record
-    tidak valid, dan itu akan menghentikan for-loop biasa secara tiba-tiba
-    di titik itu -- persis kelas bug yang sama seperti pada python-evtx
-    sebelumnya, walau sumbernya beda. Pola manual di bawah memastikan satu
-    record gagal dilewati (dicatat ke error_counter) tapi iterasi lanjut
-    sampai benar-benar habis (StopIteration).
+    IMPORTANT: this uses a manual next()/try-except loop, NOT a plain
+    `for record in parser.records():`. PyEvtxParser's own documentation
+    states that iteration can raise RuntimeError when it encounters an
+    invalid record, and that would silently stop a plain for-loop right
+    there — the same class of bug that affected the previous python-evtx
+    backend, just from a different root cause. The manual pattern below
+    guarantees a single bad record is skipped (and counted/logged) while
+    iteration continues until the iterator is genuinely exhausted
+    (StopIteration).
     """
     parser = PyEvtxParser(str(evtx_path))
     it = iter(parser.records())
@@ -256,7 +360,7 @@ def iter_records(evtx_path, error_counter):
         except RuntimeError as e:
             error_counter["record_failed"] += 1
             print(
-                f"[!] Gagal membaca satu record (RuntimeError dari parser): {e}",
+                f"[!] Failed to read a record (parser RuntimeError): {e}",
                 file=sys.stderr,
             )
             continue
@@ -266,53 +370,53 @@ def iter_records(evtx_path, error_counter):
         except Exception as e:
             error_counter["record_failed"] += 1
             rn = record.get("event_record_id", "?")
-            print(f"[!] Gagal parse XML record #{rn}: {e}", file=sys.stderr)
+            print(f"[!] Failed to parse XML for record #{rn}: {e}", file=sys.stderr)
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Parse file .evtx langsung menjadi CSV flat (tanpa JSON di dalam sel).",
+        description="Parse a .evtx file directly into a flat CSV (no JSON left inside any cell).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("input", help="Path file .evtx")
+    ap.add_argument("input", help="Path to the .evtx input file")
     ap.add_argument(
         "-o",
         "--output",
         default=None,
-        help="Path file CSV output. Default: <nama_input>.csv di /mnt/user-data/outputs",
+        help="Path to the output CSV. Default: <input_name>.csv under /mnt/user-data/outputs",
     )
     ap.add_argument(
         "--event-id",
         default=None,
-        help="Filter EventId tertentu, pisah koma. Contoh: 1,11,13",
+        help="Filter by EventId, comma-separated. Example: 1,11,13",
     )
     ap.add_argument(
         "--fields",
         default=None,
-        help="Batasi kolom output, pisah koma, urutan sesuai input. "
-        "Kalau tidak diisi, semua kolom (union) ikut ditulis.",
+        help="Restrict output to these columns, comma-separated, in the given order. "
+        "If omitted, all columns (the union across every event) are written.",
     )
     ap.add_argument(
         "--delimiter",
         default=",",
-        help="Delimiter CSV: ',' (default), ';', '|', atau 'tab'. "
-        "Gunakan '|' atau 'tab' kalau ingin lebih aman diproses awk "
-        "tanpa perlu menangani quoting koma di dalam CommandLine dsb.",
+        help="CSV delimiter: ',' (default), ';', '|', or 'tab'. "
+        "Use '|' or 'tab' if you want the output to be trivially safe for "
+        "awk without worrying about comma-quoting inside CommandLine, etc.",
     )
     args = ap.parse_args()
 
     in_path = Path(args.input)
     if not in_path.exists():
-        print(f"File tidak ditemukan: {in_path}", file=sys.stderr)
+        print(f"File not found: {in_path}", file=sys.stderr)
         sys.exit(1)
     if in_path.stat().st_size == 0:
-        print(f"File kosong (0 byte): {in_path}", file=sys.stderr)
+        print(f"File is empty (0 bytes): {in_path}", file=sys.stderr)
         sys.exit(1)
 
     delim_key = args.delimiter.lower()
     if delim_key not in DELIMITER_MAP:
         print(
-            f"Delimiter '{args.delimiter}' tidak dikenal. Pilih salah satu: , ; | tab",
+            f"Unrecognized delimiter '{args.delimiter}'. Choose one of: , ; | tab",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -330,7 +434,7 @@ def main():
         outdir.mkdir(parents=True, exist_ok=True)
         out_path = outdir / f"{in_path.stem}.csv"
 
-    print(f"[1/2] Membaca: {in_path.name} ...")
+    print(f"[1/2] Reading: {in_path.name} ...")
 
     all_columns = list(FIXED_COLUMNS)
     seen = set(all_columns)
@@ -343,7 +447,7 @@ def main():
     for rec in iter_records(in_path, errors):
         total_read += 1
         if total_read % PROGRESS_EVERY == 0:
-            print(f"    ... {total_read} record dibaca", file=sys.stderr)
+            print(f"    ... {total_read} records read", file=sys.stderr)
 
         if event_ids is not None and rec.get("EventId") not in event_ids:
             continue
@@ -358,8 +462,8 @@ def main():
         unknown = [f for f in wanted if f not in seen]
         if unknown:
             print(
-                f"[!] Peringatan: field berikut tidak pernah muncul di data, "
-                f"kolomnya akan kosong semua: {', '.join(unknown)}",
+                f"[!] Warning: these fields never appear in the data, "
+                f"their columns will be empty: {', '.join(unknown)}",
                 file=sys.stderr,
             )
         final_columns = wanted
@@ -368,47 +472,55 @@ def main():
 
     if not records_buffer:
         print(
-            "\n[!] Tidak ada record yang cocok (setelah filter). Tidak ada CSV dibuat.",
+            "\n[!] No records matched the filter. No CSV file was created.",
             file=sys.stderr,
         )
         if errors["record_failed"]:
             print(
-                f"    Record gagal dibaca/parse: {errors['record_failed']}",
+                f"    Records that failed to read/parse: {errors['record_failed']}",
                 file=sys.stderr,
             )
         sys.exit(1)
 
     print(
-        f"[2/2] Menulis {len(records_buffer)} baris x {len(final_columns)} kolom -> {out_path}"
+        f"[2/2] Writing {len(records_buffer)} rows x {len(final_columns)} columns -> {out_path}"
     )
 
-    with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        # NOTE: intentionally "utf-8", NOT "utf-8-sig". A UTF-8 BOM at the
+        # start of the file is invisible in most editors but becomes part of
+        # the very first header cell's text (e.g. "\ufeffTimeCreated"
+        # instead of "TimeCreated"). That silently breaks any awk/grep/etc.
+        # header-lookup pattern like `h[$1]=="TimeCreated"` for the FIRST
+        # column only, which is a nasty, hard-to-spot bug. Modern Excel
+        # and most tools read UTF-8 without a BOM just fine, so it's safer
+        # to leave it out.
         writer = csv.DictWriter(
             f,
             fieldnames=final_columns,
             extrasaction="ignore",
             delimiter=delimiter,
             quoting=csv.QUOTE_MINIMAL,
-            lineterminator="\n",  # default csv module adalah "\r\n" (RFC4180); dipakai
-            # "\n" murni supaya ramah untuk awk/grep/wc -l di Linux
-            # dan tidak menyisakan \r yang menempel di kolom terakhir.
+            lineterminator="\n",  # the csv module defaults to "\r\n" (RFC4180); using a
+            # plain "\n" keeps output friendly for awk/grep/wc -l on
+            # Linux and avoids a stray \r stuck to the last column.
         )
         writer.writeheader()
         for rec in records_buffer:
             row = {k: rec.get(k, "") for k in final_columns}
             writer.writerow(row)
 
-    print(f"\nTotal record dibaca dari evtx : {total_read}")
-    print(f"Total baris ditulis ke CSV    : {len(records_buffer)}")
-    print(f"Total kolom (union)           : {len(all_columns)}")
-    print(f"Delimiter                     : {args.delimiter!r}")
-    print(f"Output                        : {out_path}")
+    print(f"\nTotal records read from evtx : {total_read}")
+    print(f"Total rows written to CSV    : {len(records_buffer)}")
+    print(f"Total columns (union)        : {len(all_columns)}")
+    print(f"Delimiter                    : {args.delimiter!r}")
+    print(f"Output                       : {out_path}")
     if errors["record_failed"]:
-        print(f"\n[!] Record gagal dibaca/parse: {errors['record_failed']}")
-        print("    (detail sudah dicetak ke stderr di atas)")
+        print(f"\n[!] Records that failed to read/parse: {errors['record_failed']}")
+        print("    (details were printed to stderr above)")
 
     c = Counter(rec.get("EventId", "") for rec in records_buffer)
-    print("\nRingkasan per EventId:")
+    print("\nSummary by EventId:")
     for eid, cnt in sorted(c.items(), key=lambda x: -x[1]):
         print(f"  {cnt:6d}  EventId={eid}")
 
