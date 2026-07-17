@@ -22,9 +22,15 @@ Features:
   - Cross-validation warnings (e.g. metrics count vs filename count mismatch)
   - Console (human-readable), JSON, and CSV output (summary + timeline,
     single-file or batch across a whole Prefetch folder)
+  - Forensic traceability: input file is opened read-only and its
+    original atime is restored best-effort after read; SHA-256 of the
+    input file, extraction timestamp (UTC), tool version, and git commit
+    (if available) are recorded on every parsed record and in every
+    output format
 
 Usage:
   python3 prefetch_parser.py file1.pf [file2.pf ...]
+  python3 prefetch_parser.py file1.pf [file2.pf ...] --csv ./out_folder
   python3 prefetch_parser.py --dir /path/to/Prefetch/folder
   python3 prefetch_parser.py --dir /path/to/Prefetch/folder --csv ./out
   python3 prefetch_parser.py file1.pf --json
@@ -36,9 +42,41 @@ import sys
 import os
 import csv
 import json
+import hashlib
+import subprocess
 import datetime
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict
+
+# ---------------------------------------------------------------------------
+# 0. Tool metadata / forensic traceability
+# ---------------------------------------------------------------------------
+# Bump TOOL_VERSION whenever parsing logic changes. Record the exact
+# TOOL_VERSION + git commit used for a given case in your case notes -
+# this is what lets you answer "which exact code produced this output"
+# under cross-examination.
+TOOL_VERSION = "1.1.0"
+
+
+def _get_tool_git_commit() -> Optional[str]:
+    """Best-effort short git commit hash of this script's repo. Returns
+    None (never raises) if this isn't a git checkout, git isn't
+    installed, or the lookup fails for any reason - callers must not
+    depend on this being present."""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=script_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +289,10 @@ class AccessedFile:
 @dataclass
 class PrefetchData:
     file_path: str = ""
+    sha256: str = ""
+    extraction_timestamp: str = ""
+    tool_version: str = ""
+    tool_git_commit: Optional[str] = None
     format_version: int = 0
     os_guess: str = ""
     signature: str = ""
@@ -315,15 +357,42 @@ def decode_file_reference(ref: int):
 # ---------------------------------------------------------------------------
 class PrefetchParser:
     def parse_file(self, file_path: str) -> PrefetchData:
-        with open(file_path, "rb") as f:
-            raw = f.read()
+        # Snapshot original stat before touching the file at all. Opening
+        # a file for read can itself update NTFS Last Accessed Time (atime)
+        # depending on filesystem/OS settings; we restore it afterward on
+        # a best-effort basis. Note this is a courtesy, not a guarantee -
+        # working from a write-blocked image/mount is the only real
+        # guarantee of evidence integrity.
+        orig_stat = None
+        try:
+            orig_stat = os.stat(file_path)
+        except OSError:
+            pass
 
-        raw = decompress_mam(raw)
+        with open(file_path, "rb") as f:
+            raw_input = f.read()
+
+        if orig_stat is not None:
+            try:
+                os.utime(file_path, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
+            except OSError:
+                pass  # e.g. read-only evidence mount - atime was never touched
+
+        input_sha256 = hashlib.sha256(raw_input).hexdigest()
+        extraction_ts = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S UTC"
+        )
+
+        raw = decompress_mam(raw_input)
 
         if len(raw) < 0x54 or raw[4:8] != b"SCCA":
             raise ValueError("Signature 'SCCA' not found - not a valid Prefetch file")
 
         pf = PrefetchData(file_path=file_path)
+        pf.sha256 = input_sha256
+        pf.extraction_timestamp = extraction_ts
+        pf.tool_version = TOOL_VERSION
+        pf.tool_git_commit = _get_tool_git_commit()
         pf.file_size = len(raw)
         pf.signature = "SCCA"
 
@@ -561,6 +630,12 @@ class PrefetchParser:
 def print_human(pf: PrefetchData, full: bool = False):
     print("=" * 78)
     print(f"File              : {pf.file_path}")
+    print(f"SHA-256 (input)   : {pf.sha256}")
+    print(f"Extracted         : {pf.extraction_timestamp}")
+    print(
+        f"Tool Version      : {pf.tool_version}"
+        + (f" (git {pf.tool_git_commit})" if pf.tool_git_commit else "")
+    )
     print(f"Format Version    : {pf.format_version} ({pf.os_guess})")
     print(f"Executable Name   : {pf.executable_name}")
     print(f"Prefetch Hash     : {pf.prefetch_hash}")
@@ -607,6 +682,10 @@ def print_human(pf: PrefetchData, full: bool = False):
 def write_csv_summary(results: List[PrefetchData], out_path: str):
     fieldnames = [
         "SourceFile",
+        "SHA256",
+        "ExtractionTimestamp",
+        "ToolVersion",
+        "ToolGitCommit",
         "FormatVersion",
         "OSGuess",
         "ExecutableName",
@@ -634,6 +713,10 @@ def write_csv_summary(results: List[PrefetchData], out_path: str):
         for pf in results:
             row = {
                 "SourceFile": pf.file_path,
+                "SHA256": pf.sha256,
+                "ExtractionTimestamp": pf.extraction_timestamp,
+                "ToolVersion": pf.tool_version,
+                "ToolGitCommit": pf.tool_git_commit or "",
                 "FormatVersion": pf.format_version,
                 "OSGuess": pf.os_guess,
                 "ExecutableName": pf.executable_name,
@@ -667,6 +750,8 @@ def write_csv_timeline(results: List[PrefetchData], out_path: str):
                     "PrefetchHash": pf.prefetch_hash,
                     "RunCount": pf.run_count,
                     "SourceFile": pf.file_path,
+                    "SHA256": pf.sha256,
+                    "ToolVersion": pf.tool_version,
                 }
             )
     rows.sort(key=lambda r: r["Timestamp"], reverse=True)
@@ -679,6 +764,8 @@ def write_csv_timeline(results: List[PrefetchData], out_path: str):
                 "PrefetchHash",
                 "RunCount",
                 "SourceFile",
+                "SHA256",
+                "ToolVersion",
             ],
         )
         writer.writeheader()
@@ -695,6 +782,8 @@ def write_csv_accessed_files(results: List[PrefetchData], out_path: str):
                 "AccessedFilePath",
                 "MFTEntry",
                 "MFTSequence",
+                "SHA256",
+                "ToolVersion",
             ],
         )
         writer.writeheader()
@@ -709,6 +798,8 @@ def write_csv_accessed_files(results: List[PrefetchData], out_path: str):
                         "MFTSequence": (
                             af.mft_sequence if af.mft_sequence is not None else ""
                         ),
+                        "SHA256": pf.sha256,
+                        "ToolVersion": pf.tool_version,
                     }
                 )
 
@@ -788,4 +879,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

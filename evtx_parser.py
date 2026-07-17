@@ -9,6 +9,42 @@ into awk, cut, grep, etc. without any further parsing.
 --------------------------------------------------------------------------
 CHANGELOG
 
+v7:
+  - `clean_value()` now also replaces any literal comma inside a field
+    value with a semicolon (same treatment as \r/\n/\t already got). The
+    CSV itself was already correctly comma-quoted (QUOTE_MINIMAL), but a
+    plain `awk -F','` does not understand CSV quoting, so a field like
+    Sysmon's "Hashes" (SHA1=..,MD5=..,SHA256=..) would silently split into
+    extra columns under naive awk/cut usage. This affects every delimiter
+    mode, not just the default comma one, since the underlying value is
+    normalized once regardless of --delimiter.
+
+v6:
+  - Fixed a crash bug: an invalid/corrupt/non-EVTX input file made
+    `PyEvtxParser(...)` raise (e.g. OSError on a bad header) from inside
+    the `iter_records()` generator, on its first `next()` call, uninitialized/
+    unguarded — this printed a raw Python traceback and gave no chance to
+    log a clean, descriptive error before exiting. Parser construction is
+    now done in `main()` inside its own try/except, so a bad file gets a
+    single descriptive stderr line and `sys.exit(1)`, same as the existing
+    "file not found" / "file is empty" checks, instead of a stack trace.
+  - Added forensic chain-of-custody metadata: SHA-256 of the input file
+    (streamed in chunks - evtx files can be large), UTC extraction
+    timestamp, tool version, and git commit (best-effort) are now computed
+    per run and written to a sidecar `<output>.csv.manifest.json`, plus
+    printed to the console summary. Deliberately NOT added as extra
+    columns on every CSV data row: this script's whole design goal (see
+    module docstring) is a clean flat CSV safe for awk/grep with one
+    record per line, and this script only ever processes one input file
+    per run — so repeating the same hash/timestamp on every one of
+    potentially tens of thousands of rows would only add noise, unlike
+    prefetch_parser.py's per-record CSV columns, which exist there because
+    that tool batches many distinct input files into one combined CSV.
+  - Original file access time (atime) is snapshotted before reading and
+    restored afterward on a best-effort basis (silently skipped if the
+    restore fails, e.g. on a read-only evidence mount, since atime was
+    never touched in that case anyway).
+
 v5:
   - Renamed a small set of genuinely ambiguous raw field names that Windows/
     Sysmon itself uses. These are NOT collisions with fixed columns (that
@@ -113,8 +149,13 @@ Examples:
 """
 
 import sys
+import os
 import csv
+import json
 import argparse
+import hashlib
+import subprocess
+import datetime
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from collections import Counter
@@ -128,6 +169,41 @@ except ImportError:
         file=sys.stderr,
     )
     sys.exit(1)
+
+# Bump on any change to parsing/output logic. Record this + the git commit
+# in case notes - same rationale as prefetch_parser.py's TOOL_VERSION.
+TOOL_VERSION = "1.2.0"
+
+
+def _get_tool_git_commit():
+    """Best-effort short git commit hash of this script's repo. Never
+    raises - returns None if not a git checkout, git missing, etc."""
+    try:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=script_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return None
+
+
+def _sha256_file(path, chunk_size=1024 * 1024):
+    """SHA-256 of the input file, streamed in chunks rather than
+    read()-ing the whole thing into memory - evtx files (unlike small
+    .pf files) can easily be hundreds of MB to multiple GB."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 NS = {"e": "http://schemas.microsoft.com/win/2004/08/events/event"}
 
@@ -185,6 +261,11 @@ def clean_value(text):
     - No \\r or \\n survives (replaced with a space) -> 1 record = 1 physical
       CSV line.
     - No tab survives (replaced with a space) -> also safe with --delimiter tab.
+    - No comma survives (replaced with a semicolon) -> the CSV is properly
+      comma-quoted (QUOTE_MINIMAL) already, but a naive `awk -F','` doesn't
+      understand CSV quoting and will split a value like Sysmon's "Hashes"
+      field (SHA1=..,MD5=..,SHA256=..) into extra columns. Semicolon keeps
+      the same "list of sub-values" meaning without breaking that split.
     - Leading/trailing/duplicate whitespace is collapsed.
     Without this, a field such as a newline-separated list of paths (common
     in Windows Error Reporting Event ID 1001) would spread a single record
@@ -198,6 +279,7 @@ def clean_value(text):
         .replace("\r", " ")
         .replace("\n", " ")
         .replace("\t", " ")
+        .replace(",", ";")
     )
     text = " ".join(text.split())
     return text
@@ -335,10 +417,10 @@ def _text(parent, tag):
     return clean_value(el.text) if (el is not None and el.text) else ""
 
 
-def iter_records(evtx_path, error_counter):
+def iter_records(parser, error_counter):
     """
-    Generator: read a .evtx file via the `evtx` (Rust) library and yield one
-    flat record dict per event.
+    Generator: read records from an already-open PyEvtxParser and yield
+    one flat record dict per event.
 
     IMPORTANT: this uses a manual next()/try-except loop, NOT a plain
     `for record in parser.records():`. PyEvtxParser's own documentation
@@ -350,7 +432,6 @@ def iter_records(evtx_path, error_counter):
     iteration continues until the iterator is genuinely exhausted
     (StopIteration).
     """
-    parser = PyEvtxParser(str(evtx_path))
     it = iter(parser.records())
     while True:
         try:
@@ -436,6 +517,29 @@ def main():
 
     print(f"[1/2] Reading: {in_path.name} ...")
 
+    # Snapshot original stat before any read touches the file, so atime can
+    # be restored afterward on a best-effort basis (see prefetch_parser.py
+    # for the same pattern / same caveat: not a guarantee, a courtesy).
+    try:
+        orig_stat = in_path.stat()
+    except OSError:
+        orig_stat = None
+
+    input_sha256 = _sha256_file(in_path)
+    extraction_ts = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC"
+    )
+
+    try:
+        parser = PyEvtxParser(str(in_path))
+    except Exception as e:
+        print(
+            f"[!] Failed to open '{in_path}' as an EVTX file "
+            f"(corrupt, truncated, wrong format, or unsupported): {e}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     all_columns = list(FIXED_COLUMNS)
     seen = set(all_columns)
     records_buffer = []
@@ -444,7 +548,7 @@ def main():
     total_read = 0
     PROGRESS_EVERY = 5000
 
-    for rec in iter_records(in_path, errors):
+    for rec in iter_records(parser, errors):
         total_read += 1
         if total_read % PROGRESS_EVERY == 0:
             print(f"    ... {total_read} records read", file=sys.stderr)
@@ -456,6 +560,12 @@ def main():
             if k not in seen:
                 seen.add(k)
                 all_columns.append(k)
+
+    if orig_stat is not None:
+        try:
+            os.utime(in_path, ns=(orig_stat.st_atime_ns, orig_stat.st_mtime_ns))
+        except OSError:
+            pass  # e.g. read-only evidence mount - atime was never touched
 
     if args.fields:
         wanted = [f.strip() for f in args.fields.split(",") if f.strip()]
@@ -510,11 +620,38 @@ def main():
             row = {k: rec.get(k, "") for k in final_columns}
             writer.writerow(row)
 
-    print(f"\nTotal records read from evtx : {total_read}")
+    manifest = {
+        "source_file": str(in_path.resolve()),
+        "sha256": input_sha256,
+        "extraction_timestamp": extraction_ts,
+        "tool_version": TOOL_VERSION,
+        "tool_git_commit": _get_tool_git_commit(),
+        "total_records_read": total_read,
+        "rows_written": len(records_buffer),
+        "columns_written": final_columns,
+        "records_failed": errors["record_failed"],
+        "output_csv": str(out_path.resolve()),
+    }
+    manifest_path = out_path.with_suffix(out_path.suffix + ".manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    print(f"\nSHA-256 (input)               : {input_sha256}")
+    print(f"Extracted                     : {extraction_ts}")
+    print(
+        f"Tool Version                  : {TOOL_VERSION}"
+        + (
+            f" (git {manifest['tool_git_commit']})"
+            if manifest["tool_git_commit"]
+            else ""
+        )
+    )
+    print(f"Total records read from evtx : {total_read}")
     print(f"Total rows written to CSV    : {len(records_buffer)}")
     print(f"Total columns (union)        : {len(all_columns)}")
     print(f"Delimiter                    : {args.delimiter!r}")
     print(f"Output                       : {out_path}")
+    print(f"Manifest (chain-of-custody)  : {manifest_path}")
     if errors["record_failed"]:
         print(f"\n[!] Records that failed to read/parse: {errors['record_failed']}")
         print("    (details were printed to stderr above)")
