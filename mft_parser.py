@@ -44,7 +44,7 @@ FIELDNAMES = [
     "logical_size",
     "has_data_attr",
     "data_resident",
-    "resident_data",
+    "resident_data",  # printable ASCII; non-printable bytes shown as \xNN
     "all_names",
 ]
 
@@ -74,6 +74,26 @@ def apply_fixup(record, sector_size=512):
         replacement = record[usa_offset + i * 2 : usa_offset + i * 2 + 2]
         record[sector_end : sector_end + 2] = replacement
     return bytes(record)
+
+
+def bytes_to_readable(data):
+    """Render bytes as printable ASCII for CSV-safe display.
+
+    NUL bytes dropped entirely (not escaped) — UTF-16LE text like
+    'M\\x00a\\x00i\\x00n\\x00' becomes readable 'Main' this way, and
+    dropping a byte can never break CSV output. Other non-printable
+    bytes still escaped as \\xNN since they carry real binary meaning
+    and can't be safely dropped without losing structure.
+    """
+    out = []
+    for b in data:
+        if b == 0:
+            continue
+        elif 32 <= b <= 126:
+            out.append(chr(b))
+        else:
+            out.append(f"\\x{b:02x}")
+    return "".join(out)
 
 
 def parse_record(raw, record_num):
@@ -150,9 +170,14 @@ def parse_record(raw, record_num):
                 if not non_resident:
                     data_size = struct.unpack_from("<I", raw, offset + 16)[0]
                     content_offset = struct.unpack_from("<H", raw, offset + 20)[0]
-                    resident_data = raw[
-                        offset + content_offset : offset + content_offset + data_size
-                    ].decode("latin-1")
+                    resident_data = bytes_to_readable(
+                        raw[
+                            offset
+                            + content_offset : offset
+                            + content_offset
+                            + data_size
+                        ]
+                    )
                 else:
                     data_size = struct.unpack_from("<Q", raw, offset + 48)[0]
 
